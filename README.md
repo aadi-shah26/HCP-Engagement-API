@@ -1,297 +1,182 @@
 # HCP Engagement API
 
-A comprehensive healthcare professional engagement platform with AI-powered medical literature search, risk assessment, and analytics capabilities.
+[![CI](https://github.com/aadi-shah26/hcp-engagement-api/actions/workflows/ci.yml/badge.svg)](https://github.com/aadi-shah26/hcp-engagement-api/actions/workflows/ci.yml)
 
-![top screenshot](docs/dashboard-top.png)
-----
-![bottom screenshot](docs/dashboard-bottom.png)
+An AI clinical literature co-pilot for healthcare providers. A clinician searches a topic; the app pulls matching studies from PubMed and streams a Groq LLM synthesis of them into the dashboard in real time, alongside risk, cost and population analytics.
+
+Built at HackGT 12, then extended with real-time streaming, Docker, security hardening, automated tests and CI.
+
+![Dashboard (top)](docs/dashboard-top.png)
+![Dashboard (bottom)](docs/dashboard-bottom.png)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    B[Browser<br/>Next.js + React] -- "REST /api/proxy/*" --> N[Next.js server<br/>API proxy]
+    N -- REST + JWT --> F[Flask API<br/>Gunicorn]
+    B <-. "WebSocket (Socket.IO)<br/>JWT in handshake" .-> F
+    F -- query --> P[(PubMed<br/>E-utilities)]
+    F -- "chat completion<br/>(SSE stream)" --> G[(Groq LLM)]
+```
+
+1. The dashboard calls `/literature/search` through the Next.js proxy and renders PubMed results immediately.
+2. It then emits `stream_analysis` over an authenticated WebSocket. The API builds a prompt from the top studies and opens a streaming completion with Groq.
+3. Each server-sent event from Groq is forwarded to the browser as an `analysis_chunk`, so the summary appears word by word instead of after a multi-second wait.
+4. If Groq is unavailable, the API falls back to a rule-based summary; if a stream breaks partway, the client gets an error rather than a stitched-together answer.
 
 ## Features
 
-### AI-Powered Medical Search
-- **Real-time Literature Search**: Search PubMed database for medical research articles
-- **AI-Generated Summaries**: Get intelligent summaries of search results using Groq AI
-- **Real-time Streaming**: PubMed results render immediately while the Groq synthesis streams into the dashboard token by token over an authenticated WebSocket
-- **Smart Suggestions**: AI-powered autocomplete for medical terms and conditions
-- **Collapsible Article View**: Expandable article entries with full abstracts
+**Literature and AI**
+- PubMed search built from specialty, keywords and patient conditions (with offline fallback data)
+- Groq LLM synthesis streamed token by token to the dashboard over WebSockets
+- Structured JSON analysis endpoint (summary, key findings, clinical implications, confidence) with parsing and rule-based fallbacks
+- Configurable model (`GROQ_MODEL`); a newer search cancels the previous stream, including the upstream Groq request
 
-### Analytics Dashboard
-- **Risk Assessment**: AI-powered patient risk analysis with confidence scores
-- **Cost Analysis**: Treatment cost estimation and efficiency ratings
-- **Population Trends**: Demographic analysis and risk distribution
-- **Interactive Charts**: Visual representation of analytics data
+**Analytics** (rule-based and statistical, not ML)
+- Patient risk scoring and level, treatment cost estimation, population trends with pandas
+- High-risk predictions push a real-time `notification` event to the user's open sockets
 
-### Authentication & Security
-- **JWT-based Authentication**: Signed, expiring tokens on every protected REST route and on the WebSocket handshake
-- **Role-based Access**: Support for different user roles and specialties
-- **Brute-force Protection**: Failed logins are rate-limited per username
-- **Origin Allow-list**: Only configured frontend origins may open a WebSocket
-- **No Hardcoded Secrets**: Signing keys come from the environment (random per-process fallback)
+**Security**
+- JWT (HS256, 1 hour expiry) on every protected REST route and on the WebSocket handshake; socket identity comes from the token, never the client payload
+- bcrypt password hashing; failed logins rate-limited per username
+- WebSocket origin allow-list; no hardcoded or logged secrets
+
+**Engineering**
+- Docker images for API and frontend (non-root, health-checked) and a one-command Compose stack
+- Offline pytest suite (auth, rate limiting, socket auth, streaming order, cancellation, fallbacks) and GitHub Actions CI
 
 ## Tech Stack
 
-### Backend
-- **Flask**: Python web framework
-- **Flask-SocketIO**: WebSocket streaming of AI responses and real-time alerts
-- **PyJWT + bcrypt**: JWT authentication and password hashing
-- **Flask-Limiter**: Login rate limiting
-- **Groq AI**: AI-powered analysis and summaries (streamed via server-sent events)
-- **PubMed API**: Medical literature search via `pymed`
-- **Gunicorn**: Threaded production server
+| Layer | Tools |
+|---|---|
+| Backend | Python 3.11, Flask, Flask-RESTX (Swagger), Flask-SocketIO, Flask-Limiter, PyJWT, bcrypt, pandas, Gunicorn |
+| AI and data | Groq API (Llama 3.x, streamed via SSE), PubMed via `pymed` |
+| Frontend | Next.js 14, React 18, TypeScript, Tailwind CSS, socket.io-client |
+| Infrastructure | Docker, Docker Compose, GitHub Actions |
 
-### Frontend
-- **Next.js**: React framework
-- **TypeScript**: Type-safe JavaScript
-- **Tailwind CSS**: Utility-first CSS framework
-- **Lucide React**: Beautiful icons
-- **API Proxy**: Next.js API routes for backend communication
-- **socket.io-client**: Receives streamed AI output in real time
+## Quick Start (Docker)
 
-### Infrastructure
-- **Docker**: Separate images for the API and frontend (non-root, health-checked)
-- **Docker Compose**: One command to run the full stack
-
-## Prerequisites
-
-- Groq API key
-- **With Docker:** Docker with Compose v2
-- **Without Docker:** Python 3.11, Node.js 18+, npm
-
-## Quick Start with Docker
+You need Docker with Compose v2 and a free Groq API key from [console.groq.com](https://console.groq.com).
 
 ```bash
+git clone https://github.com/aadi-shah26/hcp-engagement-api.git
+cd hcp-engagement-api
 cp hcp-engagement-api-dev/.env.example hcp-engagement-api-dev/.env
 # edit .env: set GROQ_API_KEY, SECRET_KEY and JWT_SECRET_KEY
-
 docker compose up --build
 ```
 
-- Frontend: http://localhost:3000
-- Backend API docs: http://localhost:5000/docs/
+- App: http://localhost:3000 (demo login `demo_provider` / `demo123`)
+- API docs (Swagger): http://localhost:5000/docs/
+- Health: http://localhost:5000/health (`groq_integration.available` should be `true`)
 
-The frontend container reaches the API over the Compose network (`BACKEND_URL=http://backend:5000`); the browser opens the streaming WebSocket to `localhost:5000`. The API runs as a single Gunicorn process with threads, because WebSocket sessions and rate limits are kept in memory.
+Without a Groq key the app still runs, but summaries fall back to rule-based keyword matching.
 
-## Quick Start without Docker
+## Running Without Docker
 
-### 1. Clone the Repository
-```bash
-git clone <repository-url>
-cd demo-hcp-engagement-api
-```
-
-### 2. Backend Setup
+**Backend** (Python 3.11; the pinned pandas/numpy versions don't support 3.12+)
 ```bash
 cd hcp-engagement-api-dev
-
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-# Set up environment variables (then fill in the values)
-cp .env.example .env
-
-# Start the backend server
+cp .env.example .env    # fill in values
 python3 app.py
 ```
 
-### 3. Frontend Setup
+**Frontend** (Node.js 18+)
 ```bash
 cd hcp-frontend
-
-# Install dependencies
 npm install
-
-# Start the development server
 npm run dev
 ```
 
-### 4. Access the Application
-- **Frontend**: http://localhost:3000
-- **Backend API**: http://localhost:5000
-- **Health Check**: http://localhost:5000/health
+## Configuration
 
-## Environment Variables
+Backend (`hcp-engagement-api-dev/.env`, see [`.env.example`](hcp-engagement-api-dev/.env.example)):
 
-### Backend (.env)
-See [`hcp-engagement-api-dev/.env.example`](hcp-engagement-api-dev/.env.example):
-```env
-GROQ_API_KEY=your_groq_api_key_here
-SECRET_KEY=...        # python3 -c "import secrets; print(secrets.token_hex(32))"
-JWT_SECRET_KEY=...
-ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-```
+| Variable | Purpose |
+|---|---|
+| `GROQ_API_KEY` | Groq API key (AI features fall back to rules without it) |
+| `GROQ_MODEL` | Default model, `llama-3.1-8b-instant` unless set |
+| `SECRET_KEY`, `JWT_SECRET_KEY` | Signing secrets; if unset, random per-process values are used and tokens reset on restart |
+| `ALLOWED_ORIGINS` | Browser origins allowed to open a WebSocket |
 
-### Frontend
-- `BACKEND_URL` (server-side, default `http://localhost:5000`): where the Next.js proxy sends API calls
-- `NEXT_PUBLIC_SOCKET_URL` (build time, default `http://localhost:5000`): where the browser opens the WebSocket
+Frontend:
 
-### Getting a Groq API Key
-1. Visit [Groq Console](https://console.groq.com/)
-2. Sign up/Login to your account
-3. Navigate to API Keys section
-4. Create a new API key
-5. Copy the key (starts with `gsk_`)
+| Variable | Purpose |
+|---|---|
+| `BACKEND_URL` | Where the Next.js proxy sends API calls (server-side, default `http://localhost:5000`) |
+| `NEXT_PUBLIC_SOCKET_URL` | Where the browser opens the WebSocket (build time, default `http://localhost:5000`) |
 
-## API Endpoints
+## API Reference
 
-### Authentication
-- `POST /auth/login` - User login
-- `POST /auth/logout` - User logout
+All routes except login and health need `Authorization: Bearer <token>`. Interactive docs are at `/docs/`.
 
-### Literature Search
-- `POST /literature/search` - Search medical literature with AI analysis
-- `GET /literature/health` - Literature service health check
-
-### Analytics
-- `POST /analytics/predict-risk` - Risk assessment analysis
-- `POST /analytics/predict-cost` - Cost analysis
-- `POST /analytics/population-trends` - Population analysis
-
-### AI Services
-- `POST /ai/analyze` - General AI analysis
-- `POST /ai/suggestions` - AI-powered search suggestions
+| Method | Route | Description |
+|---|---|---|
+| POST | `/auth/login` | Returns a JWT for `{username, password}` |
+| POST | `/literature/search` | PubMed search, optionally with Groq JSON analysis (`enable_ai_analysis`) |
+| POST | `/ai/analyze` | Free-text Groq analysis |
+| GET | `/ai/models` | Allowed Groq models and availability |
+| POST | `/analytics/predict-risk` | Rule-based patient risk score |
+| POST | `/analytics/predict-cost` | Treatment cost estimate |
+| POST | `/analytics/population-trends` | Population statistics |
+| GET | `/health` | Service and Groq status (public) |
 
 ### WebSocket (Socket.IO)
-Connect with `io(url, { auth: { token: '<JWT>' } })`; connections without a valid token are refused.
-- emit `stream_analysis` `{ request_id, studies, specialty, keywords, patient_conditions }`
-- receive `analysis_chunk` `{ request_id, delta }` for each generated piece of text
-- receive `analysis_done` `{ request_id, source }` when finished (`source` is `groq` or `rule_based_fallback`)
-- receive `analysis_error` `{ request_id, message }` if the stream breaks partway
 
-A newer `stream_analysis` from the same client cancels the previous one, and disconnecting stops generation upstream.
+```js
+const socket = io('http://localhost:5000', { auth: { token } });  // refused without a valid JWT
+socket.emit('stream_analysis', { request_id, studies, specialty, keywords, patient_conditions });
+socket.on('analysis_chunk', ({ request_id, delta }) => { /* append text */ });
+socket.on('analysis_done',  ({ request_id, source }) => { /* source: groq | rule_based_fallback | groq_interrupted */ });
+socket.on('analysis_error', ({ request_id, message }) => { /* stream broke partway */ });
+```
 
-## Usage
+## Testing
 
-### 1. Login
-- Default credentials: `demo_admin` / `admin123`
-- Or create new user accounts
-
-### 2. Search Medical Literature
-- Enter medical terms, conditions, or treatments
-- Get AI-powered suggestions as you type
-- View collapsible article results with full abstracts
-
-### 3. View Analytics
-- Risk assessment with confidence scores
-- Cost analysis and efficiency ratings
-- Population trends and demographics
-
-### 4. AI Summaries
-- AI-generated summaries stream in live as Groq produces them
-- Combines literature findings with analytics data
-- Powered by Groq's Llama models
-
-## Development
-
-### Backend Development
 ```bash
 cd hcp-engagement-api-dev
-source venv/bin/activate
-python3 app.py
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### Frontend Development
-```bash
-cd hcp-frontend
-npm run dev
-```
+The suite runs offline against a fake Groq server and checks, among other things, that tokens arrive incrementally rather than buffered. CI runs it on every push together with the frontend build and both Docker image builds.
 
-### Testing
-```bash
-# Test environment variables
-python3 test_env.py
+## Design Notes
 
-# Test API endpoints
-python3 test_api.py
-```
-
-## Troubleshooting
-
-### Common Issues
-
-#### Port Conflicts
-```bash
-# Kill processes on ports 5000 and 5001
-lsof -ti:5000,5001 | xargs kill -9
-```
-
-#### CORS Issues
-- The frontend uses Next.js API proxy routes to avoid CORS
-- All API calls go through `/api/proxy/*` endpoints
-
-#### Authentication Errors
-- Clear browser localStorage: `localStorage.clear()`
-- Re-login to get fresh JWT tokens
-
-#### API Key Issues
-- Verify your Groq API key is valid
-- Check the `.env` file in the backend directory
-- Restart the backend server after updating the key
-
-### Debug Mode
-- Backend logs are available in the terminal
-- Frontend console shows detailed API request/response logs
-- Check browser Network tab for failed requests
+- **Single Gunicorn worker with threads.** Socket sessions, stream state and rate-limit counters live in process memory. Scaling out would mean a Redis message queue for Socket.IO, shared limiter storage and sticky sessions.
+- **Threading mode for Socket.IO.** Groq and PubMed calls use blocking `requests`; under an un-patched eventlet loop they would stall every other client until each call finished.
+- **REST through the proxy, WebSocket direct.** The Next.js proxy avoids CORS for REST; the socket connects straight to the API, guarded by the JWT handshake and an origin allow-list.
+- **Per-username login limit.** Behind the proxy every request shares one IP, so limiting by IP would lock out all users at once.
 
 ## Project Structure
 
 ```
-demo-hcp-engagement-api/
-├── hcp-engagement-api-dev/          # Backend Flask API
-│   ├── app.py                       # Main Flask application
-│   ├── requirements.txt             # Python dependencies
-│   ├── .env                         # Environment variables
-│   └── test_*.py                    # Test scripts
-├── hcp-frontend/                    # Frontend Next.js app
-│   ├── src/app/                     # Next.js app directory
-│   │   ├── login/                   # Login page
-│   │   ├── dashboard/               # Main dashboard
-│   │   └── api/proxy/               # API proxy routes
-│   ├── package.json                 # Node.js dependencies
-│   └── next.config.js               # Next.js configuration
-└── README.md                        # This file
+hcp-engagement-api/
+├── docker-compose.yml
+├── .github/workflows/ci.yml
+├── hcp-engagement-api-dev/        # Flask API
+│   ├── app.py
+│   ├── Dockerfile
+│   ├── requirements.txt / requirements-dev.txt
+│   ├── tests/                     # automated pytest suite
+│   └── scripts/                   # manual smoke checks against a running server
+└── hcp-frontend/                  # Next.js frontend
+    ├── Dockerfile
+    └── src/app/
+        ├── login/
+        ├── dashboard/             # search, streaming summary, analytics
+        └── api/proxy/             # REST proxy to the API
 ```
 
-## Contributing
+## Limitations
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Support
-
-For issues and questions:
-1. Check the troubleshooting section above
-2. Review the console logs for error messages
-3. Ensure all dependencies are installed correctly
-4. Verify API keys are valid and properly configured
-
-## Updates
-
-### Recent Changes
-- Added AI-powered search suggestions
-- Implemented collapsible article dropdowns
-- Added real PubMed integration
-- Enhanced AI summary generation
-- Improved error handling and debugging
-- Fixed CORS issues with Next.js proxy
-
-### Planned Features
-- User management system
-- Advanced filtering options
-- Export functionality
-- Real-time notifications
-- Mobile responsiveness improvements
+- Demo users are hardcoded; there is no user registration or database.
+- Risk, cost and population analytics are rule-based demonstrations, not validated clinical models.
+- Patient context is sent to a third-party LLM, so this is not suitable for real patient data (no HIPAA controls).
 
 ## Credits
 
-Built at HackGT 12 with [@aandrx](https://github.com/aandrx).
+Built at HackGT 12 with [@aandrx](https://github.com/aandrx). Licensed under the MIT License (see [LICENSE](LICENSE)).
