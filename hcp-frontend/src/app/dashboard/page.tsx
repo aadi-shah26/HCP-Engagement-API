@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { io, Socket } from 'socket.io-client';
 import { 
   Search, 
   BookOpen, 
@@ -71,6 +72,9 @@ interface PopulationAnalysis {
   timestamp: string;
 }
 
+// The browser opens the WebSocket straight to the backend (REST calls go through the Next.js proxy)
+const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL || 'http://localhost:5000';
+
 export default function DashboardPage() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeTab, setActiveTab] = useState('search');
@@ -96,6 +100,10 @@ export default function DashboardPage() {
   const [aiSummary, setAiSummary] = useState<string | null>(null);
   const [literatureAiSummary, setLiteratureAiSummary] = useState<string | null>(null);
   const [isGeneratingSummary, setIsGeneratingSummary] = useState<boolean>(false);
+  const [isStreamingSummary, setIsStreamingSummary] = useState<boolean>(false);
+  const socketRef = useRef<Socket | null>(null);
+  // Only chunks for the latest search are rendered; late chunks from older searches are dropped
+  const activeStreamIdRef = useRef<string | null>(null);
   
   const router = useRouter();
 
@@ -128,6 +136,70 @@ export default function DashboardPage() {
   useEffect(() => {
     console.log('aiSummary state changed:', aiSummary);
   }, [aiSummary]);
+
+  // Authenticated WebSocket used to stream the AI summary token by token
+  useEffect(() => {
+    if (!currentUser) return;
+    const token = localStorage.getItem('authToken');
+    if (!token) return;
+
+    const socket = io(SOCKET_URL, { auth: { token }, transports: ['websocket'] });
+
+    const finishStream = (requestId: string) => {
+      if (requestId !== activeStreamIdRef.current) return;
+      activeStreamIdRef.current = null;
+      setIsStreamingSummary(false);
+    };
+
+    socket.on('analysis_chunk', ({ request_id, delta }: { request_id: string; delta: string }) => {
+      if (request_id !== activeStreamIdRef.current) return;
+      setLiteratureAiSummary((prev) => (prev || '') + delta);
+    });
+    socket.on('analysis_done', ({ request_id }: { request_id: string }) => finishStream(request_id));
+    socket.on('analysis_error', ({ request_id, message }: { request_id: string; message: string }) => {
+      if (request_id !== activeStreamIdRef.current) return;
+      setLiteratureAiSummary((prev) => `${prev || ''}\n\n[${message}]`);
+      finishStream(request_id);
+    });
+    socket.on('disconnect', () => {
+      // An in-flight stream can't resume on a new connection
+      if (activeStreamIdRef.current) finishStream(activeStreamIdRef.current);
+    });
+    socket.on('connect_error', (err) => {
+      console.warn('Streaming socket unavailable, falling back to REST summaries:', err.message);
+    });
+
+    socketRef.current = socket;
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [currentUser]);
+
+  const startStreamingSummary = (
+    studies: SearchResult[],
+    keywords: string[],
+    conditions: string[]
+  ) => {
+    const socket = socketRef.current;
+    if (!socket || !socket.connected || studies.length === 0) return false;
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    activeStreamIdRef.current = requestId;
+    setLiteratureAiSummary('');
+    setIsStreamingSummary(true);
+    socket.emit('stream_analysis', {
+      request_id: requestId,
+      specialty: filters.specialty || 'General Medicine',
+      keywords,
+      patient_conditions: conditions,
+      model: 'llama-3.1-8b-instant',
+      studies: studies.slice(0, 5).map(({ title, journal, publication_date, abstract }) => ({
+        title, journal, publication_date, abstract
+      }))
+    });
+    return true;
+  };
 
   const handleLogout = () => {
     localStorage.removeItem('authToken');
@@ -176,6 +248,8 @@ export default function DashboardPage() {
     setShowSuggestions(false);
     setAiSummary(null); // Clear previous AI summary
     setLiteratureAiSummary(null); // Clear previous literature AI summary
+    activeStreamIdRef.current = null; // Ignore any chunks still arriving for the previous search
+    setIsStreamingSummary(false);
     
     // Add to search tags
     if (!searchTags.includes(searchTerm)) {
@@ -202,6 +276,11 @@ export default function DashboardPage() {
         console.log('🔐 Auth token length:', authToken.length);
       }
 
+      // With a live socket, return PubMed results immediately and stream the AI synthesis
+      // afterwards; otherwise have the REST endpoint run the (blocking) AI analysis itself
+      const canStream = !!socketRef.current?.connected;
+      let summaryHandled = false;
+
       // Fetch literature search
       const literatureResponse = await fetch('/api/proxy/literature/search', {
         method: 'POST',
@@ -214,7 +293,7 @@ export default function DashboardPage() {
           keywords: keywords,
           patient_conditions: conditions,
           max_results: 10,
-          enable_ai_analysis: true,  // Explicitly enable AI analysis
+          enable_ai_analysis: !canStream,
           ai_model: 'llama-3.1-8b-instant'
         })
       });
@@ -234,20 +313,25 @@ export default function DashboardPage() {
           // USE BACKEND AI SUMMARY DIRECTLY
           if (literatureData.data.ai_analysis.summary) {
             setLiteratureAiSummary(literatureData.data.ai_analysis.summary);
+            summaryHandled = true;
           }
         } else {
           console.log('NO AI ANALYSIS in response');
           console.log('Available data keys:', Object.keys(literatureData.data || {}));
         }
-        
-        setSearchResults(literatureData.data?.studies || literatureData.studies || []);
+
+        const studies: SearchResult[] = literatureData.data?.studies || literatureData.studies || [];
+        setSearchResults(studies);
+        if (canStream && startStreamingSummary(studies, keywords, conditions)) {
+          summaryHandled = true;
+        }
       } else {
         console.error('Literature Search API Error:', await literatureResponse.text());
         setSearchResults([]);
       }
 
       // Fetch analytics data
-      await fetchAnalyticsData(searchTerm, conditions);
+      await fetchAnalyticsData(searchTerm, conditions, summaryHandled);
       
     } catch (error) {
       console.error('Search error:', error);
@@ -256,7 +340,7 @@ export default function DashboardPage() {
     }
   };
 
-  const fetchAnalyticsData = async (query: string, conditions: string[]) => {
+  const fetchAnalyticsData = async (query: string, conditions: string[], summaryHandled: boolean) => {
     try {
       console.log('Fetching analytics data for query:', query);
       console.log('Extracted conditions:', conditions);
@@ -348,8 +432,9 @@ export default function DashboardPage() {
 
       setShowAnalytics(true);
       
-      // Only generate AI summary via /ai/analyze if none was provided by literature endpoint
-      if (!literatureAiSummary) {
+      // Only generate AI summary via /ai/analyze if neither the literature endpoint nor the
+      // stream provides one (passed in explicitly: the state read here would be a stale closure)
+      if (!summaryHandled) {
         setTimeout(() => {
           generateAISummary();
         }, 300);
@@ -672,7 +757,7 @@ export default function DashboardPage() {
         </div>
 
         {/* AI Summary Box */}
-        {(literatureAiSummary || aiSummary) && (
+        {(literatureAiSummary || aiSummary || isStreamingSummary) && (
           <div className="bg-white rounded-2xl shadow-sm border p-8 mb-8">
             <div className="bg-gradient-to-br from-purple-50 to-indigo-50 rounded-xl p-4 border border-purple-200">
               <div className="flex items-center gap-3 mb-3">
@@ -681,11 +766,18 @@ export default function DashboardPage() {
                 </div>
                 <div>
                   <div className="text-sm font-semibold text-gray-900">AI Summary</div>
-                  <div className="text-xs text-gray-600">Generated from search results and analytics</div>
+                  <div className="text-xs text-gray-600">
+                    {isStreamingSummary ? 'Streaming live from Groq…' : 'Generated from search results and analytics'}
+                  </div>
                 </div>
               </div>
               <div className="bg-white rounded-lg p-3 border border-purple-200">
-                <p className="text-gray-700 text-sm leading-relaxed">{literatureAiSummary || aiSummary}</p>
+                <p className="text-gray-700 text-sm leading-relaxed whitespace-pre-wrap">
+                  {literatureAiSummary || aiSummary}
+                  {isStreamingSummary && (
+                    <span className="inline-block w-2 h-4 ml-0.5 align-text-bottom bg-purple-500 animate-pulse" />
+                  )}
+                </p>
               </div>
             </div>
           </div>

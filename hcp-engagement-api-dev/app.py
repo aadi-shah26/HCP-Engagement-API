@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 from flask_restx import Api, Resource, fields
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, ConnectionRefusedError
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 # from flask_cors import CORS 
 import jwt
 import bcrypt
@@ -11,6 +13,10 @@ import uuid
 from typing import Dict, List, Any
 import requests
 import os
+import secrets
+import threading
+import time
+from functools import wraps
 import logging
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
@@ -22,23 +28,33 @@ load_dotenv()
 
 app = Flask(__name__)
 
+def _secret_from_env(name: str) -> str:
+    """Read a signing secret from the environment; never fall back to a hardcoded value.
+
+    If unset, generate a random per-process secret so tokens can't be forged with a
+    publicly known default. Tokens then stop validating on restart, which is the safe failure.
+    """
+    value = os.getenv(name)
+    if not value:
+        print(f"WARNING: {name} not set; using a random per-process secret (tokens reset on restart)")
+        value = secrets.token_hex(32)
+    return value
+
 # Configuration for open-source deployment
 app.config.update({
-    'SECRET_KEY': os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production'),
-    'JWT_SECRET_KEY': os.getenv('JWT_SECRET_KEY', 'jwt-secret-change-in-production'),
+    'SECRET_KEY': _secret_from_env('SECRET_KEY'),
+    'JWT_SECRET_KEY': _secret_from_env('JWT_SECRET_KEY'),
     'JWT_ACCESS_TOKEN_EXPIRES': timedelta(hours=1),
     'REDIS_URL': os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
     'GROQ_API_KEY': os.getenv('GROQ_API_KEY', ''),
+    'GROQ_API_BASE': os.getenv('GROQ_API_BASE', 'https://api.groq.com/openai/v1'),
 })
 
-# Debug: Check if Groq API key is loaded
-groq_api_key = app.config['GROQ_API_KEY']
-print(f"Groq API Key Loaded: {'Yes' if groq_api_key else 'No'}")
-if groq_api_key:
-    print(f"Key length: {len(groq_api_key)} characters")
-    print(f"Key starts with: {groq_api_key[:10]}...")
-else:
-    print("WARNING: No Groq API key found in environment variables")
+# Report whether the Groq key is present without leaking any part of it
+print(f"Groq API Key Loaded: {'Yes' if app.config['GROQ_API_KEY'] else 'No'}")
+
+# Browser origins allowed to open a WebSocket (the frontend talks to REST through its own proxy)
+allowed_origins = [o.strip() for o in os.getenv('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',') if o.strip()]
 
 # cors configuration
 
@@ -115,12 +131,18 @@ api = Api(app,
     security='Bearer Auth'
 )
 
-# Initialize WebSocket for real-time features
-socketio = SocketIO(app, 
-    # cors_allowed_origins=allowed_origins,
+# Initialize WebSocket for real-time features.
+# Threading mode: Groq/PubMed calls use blocking `requests`, which would stall an
+# un-monkey-patched eventlet loop and hold back every streamed token until the end.
+socketio = SocketIO(app,
+    async_mode='threading',
+    cors_allowed_origins=allowed_origins,
     logger=logger,
     engineio_logger=False
 )
+
+# Rate limiting (in-memory; the app runs as a single process)
+limiter = Limiter(get_remote_address, app=app, default_limits=[], storage_uri="memory://")
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -236,18 +258,22 @@ class RealTimeService:
     
     def __init__(self):
         self.active_connections = {}
-    
+        self._lock = threading.Lock()  # handlers run on multiple threads
+
     def add_connection(self, user_id: str, sid: str):
         """Add WebSocket connection"""
-        if user_id not in self.active_connections:
-            self.active_connections[user_id] = set()
-        self.active_connections[user_id].add(sid)
-    
+        with self._lock:
+            self.active_connections.setdefault(user_id, set()).add(sid)
+
     def remove_connection(self, user_id: str, sid: str):
         """Remove WebSocket connection"""
-        if user_id in self.active_connections:
-            self.active_connections[user_id].discard(sid)
-    
+        with self._lock:
+            sids = self.active_connections.get(user_id)
+            if sids is not None:
+                sids.discard(sid)
+                if not sids:
+                    del self.active_connections[user_id]
+
     def send_notification(self, user_id: str, notification: Dict):
         """Send real-time notification to user"""
         message = {
@@ -255,10 +281,11 @@ class RealTimeService:
             'timestamp': datetime.utcnow().isoformat(),
             'data': notification
         }
-        
-        if user_id in self.active_connections:
-            for sid in self.active_connections[user_id]:
-                socketio.emit('notification', message, room=sid)
+
+        with self._lock:
+            sids = list(self.active_connections.get(user_id, ()))
+        for sid in sids:
+            socketio.emit('notification', message, to=sid)
 
 # Lightweight Analytics Service
 class AnalyticsService:
@@ -529,8 +556,6 @@ class GroqAnalysisService:
         self.available_models = self._get_groq_models()
         self.groq_available = self._check_groq_availability()
         logger.info(f"Groq Available: {self.groq_available}")
-        if self.groq_available:
-            logger.info(f"Groq API Key: {app.config['GROQ_API_KEY'][:10]}...")
         logger.info(f"Available Models: {list(self.available_models.keys())}")
     
     def _get_groq_models(self):
@@ -592,7 +617,7 @@ class GroqAnalysisService:
             
             logger.info(f"Calling Groq API with model: {model}")
             response = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
+                f"{app.config['GROQ_API_BASE']}/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=30
@@ -616,7 +641,86 @@ class GroqAnalysisService:
         except Exception as e:
             logger.error(f"Groq API call failed: {e}")
             return None
-    
+
+    def stream_groq_api(self, prompt: str, model: str = 'llama-3.1-8b-instant'):
+        """Yield Groq completion text incrementally as it is generated.
+
+        Uses the OpenAI-compatible server-sent-events stream. Raises on any failure so the
+        caller can decide between a fallback (nothing sent yet) and an error (partial output).
+        """
+        groq_api_key = app.config['GROQ_API_KEY']
+        if not groq_api_key:
+            raise RuntimeError("No Groq API key available")
+        if model not in self.available_models:
+            logger.warning(f"Model {model} not available, using default")
+            model = 'llama-3.1-8b-instant'
+
+        payload = {
+            'messages': [{'role': 'user', 'content': prompt}],
+            'model': model,
+            'temperature': 0.3,
+            'max_tokens': 1024,
+            'top_p': 0.9,
+            'stream': True
+        }
+        headers = {
+            'Authorization': f'Bearer {groq_api_key}',
+            'Content-Type': 'application/json'
+        }
+
+        logger.info(f"Streaming Groq API with model: {model}")
+        # (connect timeout, max gap between bytes) - a stalled stream fails instead of hanging
+        with requests.post(f"{app.config['GROQ_API_BASE']}/chat/completions",
+                           headers=headers, json=payload, stream=True, timeout=(10, 30)) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"Groq API error: {response.status_code} - {response.text[:200]}")
+            # SSE responses usually omit a charset; requests would then assume ISO-8859-1
+            response.encoding = 'utf-8'
+            # chunk_size=None yields each chunk as it arrives; the default (512 bytes) would
+            # buffer small events and deliver the whole answer at once
+            for line in response.iter_lines(chunk_size=None, decode_unicode=True):
+                if not line or not line.startswith('data:'):
+                    continue  # blank keep-alives and SSE comments
+                data = line[len('data:'):].strip()
+                if data == '[DONE]':
+                    return
+                chunk = json.loads(data)
+                if chunk.get('error'):
+                    raise RuntimeError(f"Groq stream error: {chunk['error']}")
+                choices = chunk.get('choices') or [{}]
+                delta = (choices[0].get('delta') or {}).get('content')
+                if delta:
+                    yield delta
+
+    def build_summary_prompt(self, articles: List[Dict], search_context: Dict) -> str:
+        """Prompt for a readable plain-text synthesis, suited to being shown while it streams"""
+        articles_text = ""
+        for i, article in enumerate(articles[:5]):
+            articles_text += f"""
+            Article {i+1}:
+            Title: {article.get('title', 'No title')}
+            Journal: {article.get('journal', 'Unknown')}
+            Publication Date: {article.get('publication_date', 'Unknown')}
+            Abstract: {str(article.get('abstract', 'No abstract'))[:2000]}
+            """
+
+        return f"""
+            You are a medical expert helping a healthcare provider review research quickly.
+
+            Clinical Context:
+            - Specialty: {search_context.get('specialty', 'Unknown')}
+            - Keywords: {', '.join(search_context.get('keywords', []))}
+            - Patient Conditions: {', '.join(search_context.get('patient_conditions', []))}
+
+            Articles:
+            {articles_text}
+
+            Write a concise clinical synthesis of these articles for this context: one short
+            paragraph on overall relevance, then 3-5 key findings and 2-3 clinical implications,
+            each on its own line starting with "- ". Note important limitations in one sentence.
+            Use plain text only (no markdown headings or bold). Be clinically precise.
+            """
+
     def analyze_literature_relevance(self, articles: List[Dict], search_context: Dict, model: str = 'llama-3.1-8b-instant') -> Dict:
         """Analyze how articles are relevant to the search context using Groq"""
         try:
@@ -761,9 +865,9 @@ class GroqAnalysisService:
 class RealDataLiteratureService:
     """Literature service with Groq AI-powered analysis"""
     
-    def __init__(self):
+    def __init__(self, ai_service: 'GroqAnalysisService'):
         self.pubmed_available = self._check_pubmed_availability()
-        self.ai_service = GroqAnalysisService()
+        self.ai_service = ai_service  # shared instance: avoids a second live Groq check at startup
     
     def _check_pubmed_availability(self):
         """Check if PubMed is available"""
@@ -1003,11 +1107,12 @@ auth_service = AuthService()
 realtime_service = RealTimeService()
 analytics_service = AnalyticsService()
 ai_service = GroqAnalysisService()
-literature_service = RealDataLiteratureService()
+literature_service = RealDataLiteratureService(ai_service)
 
 # ========== AUTHENTICATION DECORATOR ==========
 
 def token_required(f):
+    @wraps(f)
     def decorated(*args, **kwargs):
         token = None
         if 'Authorization' in request.headers:
@@ -1031,30 +1136,143 @@ def token_required(f):
 
 # ========== WEB SOCKET EVENTS ==========
 
+# Authenticated identity per socket, and the one analysis stream each socket may have running
+socket_users: Dict[str, Dict] = {}
+active_streams: Dict[str, str] = {}
+socket_state_lock = threading.Lock()
+
+def _socket_user():
+    """JWT payload for the current socket, or None if unknown or the token has since expired"""
+    with socket_state_lock:
+        user = socket_users.get(request.sid)
+    if user and user.get('exp', 0) > time.time():
+        return user
+    return None
+
+def _is_current_stream(sid: str, request_id: str) -> bool:
+    with socket_state_lock:
+        return active_streams.get(sid) == request_id
+
 @socketio.on('connect')
-def handle_connect():
-    logger.info(f"Client connected: {request.sid}")
+def handle_connect(auth=None):
+    # The JWT must be presented in the handshake; identity is never taken from client payloads
+    token = auth.get('token') if isinstance(auth, dict) else None
+    if not token:
+        raise ConnectionRefusedError('Authentication token required')
+    try:
+        user = auth_service.verify_token(token)
+    except Exception as e:
+        raise ConnectionRefusedError(str(e))
+
+    with socket_state_lock:
+        socket_users[request.sid] = user
+    realtime_service.add_connection(user['user_id'], request.sid)
+    logger.info(f"Client connected: {request.sid} ({user['sub']})")
     emit('connected', {'status': 'connected', 'sid': request.sid})
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    with socket_state_lock:
+        user = socket_users.pop(request.sid, None)
+        active_streams.pop(request.sid, None)  # stops any in-flight stream for this socket
+    if user:
+        realtime_service.remove_connection(user['user_id'], request.sid)
     logger.info(f"Client disconnected: {request.sid}")
 
 @socketio.on('subscribe')
 def handle_subscribe(data):
-    """Subscribe to real-time updates"""
-    user_id = data.get('user_id')
-    channel = data.get('channel')
-    
-    if user_id and channel:
-        realtime_service.add_connection(user_id, request.sid)
+    """Subscribe to real-time updates for the authenticated user (client-sent user_id is ignored)"""
+    user = _socket_user()
+    if not user:
+        return {'status': 'error', 'message': 'Not authenticated'}
+    channel = data.get('channel') if isinstance(data, dict) else None
+    if channel:
+        realtime_service.add_connection(user['user_id'], request.sid)
         emit('subscribed', {'channel': channel, 'status': 'success'})
 
+def _run_analysis_stream(sid: str, request_id: str, studies: List[Dict], search_context: Dict, model: str):
+    """Stream a Groq synthesis to one socket, chunk by chunk.
+
+    Stops early (closing the upstream HTTP stream) if the client disconnects or starts a
+    newer request. Falls back to rule-based analysis if Groq fails before any text was sent.
+    """
+    source = 'groq'
+    sent_any = False
+    stream = None
+    try:
+        if not ai_service.groq_available:
+            raise RuntimeError("Groq not available")
+        stream = ai_service.stream_groq_api(ai_service.build_summary_prompt(studies, search_context), model)
+        for delta in stream:
+            if not _is_current_stream(sid, request_id):
+                logger.info(f"Analysis stream {request_id} superseded or disconnected; stopping")
+                return
+            socketio.emit('analysis_chunk', {'request_id': request_id, 'delta': delta}, to=sid)
+            sent_any = True
+    except Exception as e:
+        logger.warning(f"Streaming analysis failed: {e}")
+        if not _is_current_stream(sid, request_id):
+            return
+        if sent_any:
+            # Appending a different summary to half an answer would be misleading
+            source = 'groq_interrupted'
+            socketio.emit('analysis_error', {'request_id': request_id,
+                                             'message': 'AI stream was interrupted'}, to=sid)
+        else:
+            source = 'rule_based_fallback'
+            fallback = ai_service._analyze_rule_based(studies, search_context)
+            socketio.emit('analysis_chunk', {'request_id': request_id,
+                                             'delta': fallback['summary']}, to=sid)
+    finally:
+        if stream is not None:
+            stream.close()
+
+    with socket_state_lock:
+        is_current = active_streams.get(sid) == request_id
+        if is_current:
+            del active_streams[sid]
+    if is_current:
+        socketio.emit('analysis_done', {'request_id': request_id, 'source': source}, to=sid)
+
+@socketio.on('stream_analysis')
+def handle_stream_analysis(data):
+    """Start streaming an AI synthesis of already-fetched studies; tokens arrive as `analysis_chunk`"""
+    user = _socket_user()
+    if not user:
+        return {'status': 'error', 'message': 'Not authenticated or token expired'}
+    data = data if isinstance(data, dict) else {}
+
+    request_id = str(data.get('request_id') or uuid.uuid4())[:64]
+    studies = [s for s in (data.get('studies') or [])[:5] if isinstance(s, dict)]
+    search_context = {
+        'specialty': str(data.get('specialty') or 'General Medicine')[:100],
+        'keywords': [str(k)[:100] for k in (data.get('keywords') or [])[:20]],
+        'patient_conditions': [str(c)[:100] for c in (data.get('patient_conditions') or [])[:20]],
+    }
+    model = str(data.get('model') or 'llama-3.1-8b-instant')
+
+    # A new request supersedes this socket's previous one
+    with socket_state_lock:
+        active_streams[request.sid] = request_id
+    logger.info(f"Streaming analysis {request_id} for {user['sub']}")
+    socketio.start_background_task(_run_analysis_stream, request.sid, request_id,
+                                   studies, search_context, model)
+    return {'status': 'started', 'request_id': request_id}
+
 # ========== API ROUTES ==========
+
+def _login_rate_key():
+    """Rate-limit per username so one account can't be brute-forced, even through the frontend proxy"""
+    data = request.get_json(silent=True) or {}
+    return f"login:{str(data.get('username', ''))[:100].lower()}"
 
 # Authentication
 @ns_auth.route('/login')
 class Login(Resource):
+    # Only failed attempts count toward the limit
+    decorators = [limiter.limit("10 per minute", key_func=_login_rate_key,
+                                deduct_when=lambda response: response.status_code == 401)]
+
     @ns_auth.expect(login_model)
     def post(self):
         """User login"""
@@ -1307,4 +1525,6 @@ if __name__ == '__main__':
     logger.info("Authentication: Bearer token required")
     logger.info("WebSocket: Real-time notifications available")
     
-    socketio.run(app, host='0.0.0.0', port=5000, debug=os.getenv('FLASK_DEBUG', False), allow_unsafe_werkzeug=True)
+    # Parse explicitly: os.getenv returns a string, and "False" would otherwise be truthy
+    debug = os.getenv('FLASK_DEBUG', 'false').strip().lower() in ('1', 'true', 'yes')
+    socketio.run(app, host='0.0.0.0', port=5000, debug=debug, allow_unsafe_werkzeug=True)
