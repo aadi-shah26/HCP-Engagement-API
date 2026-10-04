@@ -1,0 +1,25 @@
+services:
+  backend:
+    build: ./hcp-engagement-api-dev
+    env_file: ./hcp-engagement-api-dev/.env
+    environment:
+      ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./hcp-frontend
+      args:
+        # The browser connects to the backend WebSocket through the published port
+        NEXT_PUBLIC_SOCKET_URL: http://localhost:5000
+    environment:
+      # The Next.js proxy reaches the backend over the Compose network
+      BACKEND_URL: http://backend:5000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

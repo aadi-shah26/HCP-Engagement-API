@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+// Server-side only: inside Docker Compose this is the backend service name, not localhost
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:5000';
+
 export async function POST(
   request: NextRequest,
   { params }: { params: { path: string[] } }
@@ -9,7 +12,7 @@ export async function POST(
   const authHeader = request.headers.get('authorization');
   
   try {
-    const response = await fetch(`http://localhost:5000/${path}`, {
+    const response = await fetch(`${BACKEND_URL}/${path}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -36,7 +39,7 @@ export async function GET(
   const authHeader = request.headers.get('authorization');
   
   try {
-    const response = await fetch(`http://localhost:5000/${path}`, {
+    const response = await fetch(`${BACKEND_URL}/${path}`, {
       method: 'GET',
       headers: {
         ...(authHeader && { 'Authorization': authHeader }),
