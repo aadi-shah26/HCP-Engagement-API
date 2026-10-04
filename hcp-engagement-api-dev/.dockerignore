@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 logs/
 .git
+tests/
+scripts/
+pytest.ini
+requirements-dev.txt
