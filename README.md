@@ -11,6 +11,7 @@ A comprehensive healthcare professional engagement platform with AI-powered medi
 ### AI-Powered Medical Search
 - **Real-time Literature Search**: Search PubMed database for medical research articles
 - **AI-Generated Summaries**: Get intelligent summaries of search results using Groq AI
+- **Real-time Streaming**: PubMed results render immediately while the Groq synthesis streams into the dashboard token by token over an authenticated WebSocket
 - **Smart Suggestions**: AI-powered autocomplete for medical terms and conditions
 - **Collapsible Article View**: Expandable article entries with full abstracts
 
@@ -21,19 +22,22 @@ A comprehensive healthcare professional engagement platform with AI-powered medi
 - **Interactive Charts**: Visual representation of analytics data
 
 ### Authentication & Security
-- **JWT-based Authentication**: Secure token-based user authentication
+- **JWT-based Authentication**: Signed, expiring tokens on every protected REST route and on the WebSocket handshake
 - **Role-based Access**: Support for different user roles and specialties
-- **CORS Protection**: Secure cross-origin resource sharing
+- **Brute-force Protection**: Failed logins are rate-limited per username
+- **Origin Allow-list**: Only configured frontend origins may open a WebSocket
+- **No Hardcoded Secrets**: Signing keys come from the environment (random per-process fallback)
 
 ## Tech Stack
 
 ### Backend
 - **Flask**: Python web framework
-- **Flask-SocketIO**: Real-time communication
-- **Flask-JWT-Extended**: JWT authentication
-- **Groq AI**: AI-powered analysis and summaries
+- **Flask-SocketIO**: WebSocket streaming of AI responses and real-time alerts
+- **PyJWT + bcrypt**: JWT authentication and password hashing
+- **Flask-Limiter**: Login rate limiting
+- **Groq AI**: AI-powered analysis and summaries (streamed via server-sent events)
 - **PubMed API**: Medical literature search via `pymed`
-- **Flask-CORS**: Cross-origin resource sharing
+- **Gunicorn**: Threaded production server
 
 ### Frontend
 - **Next.js**: React framework
@@ -41,15 +45,33 @@ A comprehensive healthcare professional engagement platform with AI-powered medi
 - **Tailwind CSS**: Utility-first CSS framework
 - **Lucide React**: Beautiful icons
 - **API Proxy**: Next.js API routes for backend communication
+- **socket.io-client**: Receives streamed AI output in real time
+
+### Infrastructure
+- **Docker**: Separate images for the API and frontend (non-root, health-checked)
+- **Docker Compose**: One command to run the full stack
 
 ## Prerequisites
 
-- Python 3.12+
-- Node.js 18+
-- npm or yarn
 - Groq API key
+- **With Docker:** Docker with Compose v2
+- **Without Docker:** Python 3.11, Node.js 18+, npm
 
-## Quick Start
+## Quick Start with Docker
+
+```bash
+cp hcp-engagement-api-dev/.env.example hcp-engagement-api-dev/.env
+# edit .env: set GROQ_API_KEY, SECRET_KEY and JWT_SECRET_KEY
+
+docker compose up --build
+```
+
+- Frontend: http://localhost:3000
+- Backend API docs: http://localhost:5000/docs/
+
+The frontend container reaches the API over the Compose network (`BACKEND_URL=http://backend:5000`); the browser opens the streaming WebSocket to `localhost:5000`. The API runs as a single Gunicorn process with threads, because WebSocket sessions and rate limits are kept in memory.
+
+## Quick Start without Docker
 
 ### 1. Clone the Repository
 ```bash
@@ -68,9 +90,8 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Set up environment variables
-echo "GROQ_API_KEY=your_groq_api_key_here" > .env
-echo "FLASK_DEBUG=True" >> .env
+# Set up environment variables (then fill in the values)
+cp .env.example .env
 
 # Start the backend server
 python3 app.py
@@ -95,10 +116,17 @@ npm run dev
 ## Environment Variables
 
 ### Backend (.env)
+See [`hcp-engagement-api-dev/.env.example`](hcp-engagement-api-dev/.env.example):
 ```env
 GROQ_API_KEY=your_groq_api_key_here
-FLASK_DEBUG=True
+SECRET_KEY=...        # python3 -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET_KEY=...
+ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
+
+### Frontend
+- `BACKEND_URL` (server-side, default `http://localhost:5000`): where the Next.js proxy sends API calls
+- `NEXT_PUBLIC_SOCKET_URL` (build time, default `http://localhost:5000`): where the browser opens the WebSocket
 
 ### Getting a Groq API Key
 1. Visit [Groq Console](https://console.groq.com/)
@@ -126,6 +154,15 @@ FLASK_DEBUG=True
 - `POST /ai/analyze` - General AI analysis
 - `POST /ai/suggestions` - AI-powered search suggestions
 
+### WebSocket (Socket.IO)
+Connect with `io(url, { auth: { token: '<JWT>' } })`; connections without a valid token are refused.
+- emit `stream_analysis` `{ request_id, studies, specialty, keywords, patient_conditions }`
+- receive `analysis_chunk` `{ request_id, delta }` for each generated piece of text
+- receive `analysis_done` `{ request_id, source }` when finished (`source` is `groq` or `rule_based_fallback`)
+- receive `analysis_error` `{ request_id, message }` if the stream breaks partway
+
+A newer `stream_analysis` from the same client cancels the previous one, and disconnecting stops generation upstream.
+
 ## Usage
 
 ### 1. Login
@@ -143,7 +180,7 @@ FLASK_DEBUG=True
 - Population trends and demographics
 
 ### 4. AI Summaries
-- Automatic AI-generated summaries of search results
+- AI-generated summaries stream in live as Groq produces them
 - Combines literature findings with analytics data
 - Powered by Groq's Llama models
 
@@ -254,3 +291,7 @@ For issues and questions:
 - Export functionality
 - Real-time notifications
 - Mobile responsiveness improvements
+
+## Credits
+
+Built at HackGT 12 with [@aandrx](https://github.com/aandrx).
