@@ -50,6 +50,9 @@ app.config.update({
     'GROQ_API_BASE': os.getenv('GROQ_API_BASE', 'https://api.groq.com/openai/v1'),
 })
 
+# Default Groq model; override with GROQ_MODEL if Groq retires it
+DEFAULT_GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')
+
 # Report whether the Groq key is present without leaking any part of it
 print(f"Groq API Key Loaded: {'Yes' if app.config['GROQ_API_KEY'] else 'No'}")
 
@@ -171,7 +174,7 @@ literature_search_model = api.model('LiteratureSearch', {
     'patient_conditions': fields.List(fields.String),
     'max_results': fields.Integer(default=99, description='Maximum number of results (1-99)'),  # Increased default
     'enable_ai_analysis': fields.Boolean(default=True),
-    'ai_model': fields.String(default='llama-3.1-8b-instant', description='Groq model to use'),
+    'ai_model': fields.String(default=DEFAULT_GROQ_MODEL, description='Groq model to use'),
     'response_format': fields.String(default='detailed', description='compact|detailed')
 })
 
@@ -185,7 +188,7 @@ ai_analysis_model = api.model('AIAnalysis', {
     'text': fields.String(required=True),
     'analysis_type': fields.String(required=True, description='summary|relevance|clinical_implications'),
     'context': fields.Raw(description='Additional context for analysis'),
-    'model': fields.String(default='llama-3.1-8b-instant', description='Groq model to use')
+    'model': fields.String(default=DEFAULT_GROQ_MODEL, description='Groq model to use')
 })
 
 population_analysis_model = api.model('PopulationAnalysis', {
@@ -562,10 +565,10 @@ class GroqAnalysisService:
         """Get available Groq models"""
         return {
             'llama-3.1-8b-instant': 'Llama 3.1 8B Instant',
-            'llama-3.1-70b-versatile': 'Llama 3.1 70B Versatile',  # Added valid model
-            'llama3-groq-8b-8192-tool-use-preview': 'Llama 3 8B Tool Use Preview',
-            'mixtral-8x7b-32768': 'Mixtral 8x7B',
-            'gemma2-9b-it': 'Gemma 2 9B IT'
+            'llama-3.3-70b-versatile': 'Llama 3.3 70B Versatile',
+            # Groq retires models over time; GROQ_MODEL lets a deployment switch without a code change
+            **({DEFAULT_GROQ_MODEL: DEFAULT_GROQ_MODEL} if DEFAULT_GROQ_MODEL not in (
+                'llama-3.1-8b-instant', 'llama-3.3-70b-versatile') else {})
         }
     
     def _check_groq_availability(self):
@@ -577,7 +580,7 @@ class GroqAnalysisService:
                 return False
             
             # Test the API with a simple request - USE A VALID MODEL
-            test_response = self._call_groq_api("Hello", "llama-3.1-8b-instant")  # Changed from llama3-8b-8192
+            test_response = self._call_groq_api("Hello", DEFAULT_GROQ_MODEL)
             if test_response is not None:
                 logger.info("Groq API connection successful")
                 return True
@@ -589,7 +592,7 @@ class GroqAnalysisService:
             logger.warning(f"Groq API check failed: {e}")
             return False
     
-    def _call_groq_api(self, prompt: str, model: str = 'llama-3.1-8b-instant') -> str:
+    def _call_groq_api(self, prompt: str, model: str = DEFAULT_GROQ_MODEL) -> str:
         """Make API call to Groq"""
         try:
             groq_api_key = app.config['GROQ_API_KEY']
@@ -600,7 +603,7 @@ class GroqAnalysisService:
             # Validate model name
             if model not in self.available_models:
                 logger.warning(f"Model {model} not available, using default")
-                model = 'llama-3.1-8b-instant'  # Fallback to known working model
+                model = DEFAULT_GROQ_MODEL
             
             headers = {
                 'Authorization': f'Bearer {groq_api_key}',
@@ -642,7 +645,7 @@ class GroqAnalysisService:
             logger.error(f"Groq API call failed: {e}")
             return None
 
-    def stream_groq_api(self, prompt: str, model: str = 'llama-3.1-8b-instant'):
+    def stream_groq_api(self, prompt: str, model: str = DEFAULT_GROQ_MODEL):
         """Yield Groq completion text incrementally as it is generated.
 
         Uses the OpenAI-compatible server-sent-events stream. Raises on any failure so the
@@ -653,7 +656,7 @@ class GroqAnalysisService:
             raise RuntimeError("No Groq API key available")
         if model not in self.available_models:
             logger.warning(f"Model {model} not available, using default")
-            model = 'llama-3.1-8b-instant'
+            model = DEFAULT_GROQ_MODEL
 
         payload = {
             'messages': [{'role': 'user', 'content': prompt}],
@@ -676,9 +679,10 @@ class GroqAnalysisService:
                 raise RuntimeError(f"Groq API error: {response.status_code} - {response.text[:200]}")
             # SSE responses usually omit a charset; requests would then assume ISO-8859-1
             response.encoding = 'utf-8'
-            # chunk_size=None yields each chunk as it arrives; the default (512 bytes) would
-            # buffer small events and deliver the whole answer at once
-            for line in response.iter_lines(chunk_size=None, decode_unicode=True):
+            # chunk_size=1 so each event is handled as soon as its bytes arrive. Larger sizes
+            # (incl. the 512 default) delay small events on non-chunked streams, and None
+            # buffers the entire body there. Responses are a few KB, so the cost is negligible.
+            for line in response.iter_lines(chunk_size=1, decode_unicode=True):
                 if not line or not line.startswith('data:'):
                     continue  # blank keep-alives and SSE comments
                 data = line[len('data:'):].strip()
@@ -721,7 +725,7 @@ class GroqAnalysisService:
             Use plain text only (no markdown headings or bold). Be clinically precise.
             """
 
-    def analyze_literature_relevance(self, articles: List[Dict], search_context: Dict, model: str = 'llama-3.1-8b-instant') -> Dict:
+    def analyze_literature_relevance(self, articles: List[Dict], search_context: Dict, model: str = DEFAULT_GROQ_MODEL) -> Dict:
         """Analyze how articles are relevant to the search context using Groq"""
         try:
             if self.groq_available:
@@ -884,7 +888,7 @@ class RealDataLiteratureService:
     
     def search_relevant_studies(self, specialty: str, keywords: List[str], 
                         patient_conditions: List[str], enable_ai_analysis: bool = True,
-                        ai_model: str = 'llama-3.1-8b-instant', max_results: int = 99) -> Dict:
+                        ai_model: str = DEFAULT_GROQ_MODEL, max_results: int = 99) -> Dict:
         """Search literature with configurable result limit"""
         try:
             # Validate max_results
@@ -1249,7 +1253,7 @@ def handle_stream_analysis(data):
         'keywords': [str(k)[:100] for k in (data.get('keywords') or [])[:20]],
         'patient_conditions': [str(c)[:100] for c in (data.get('patient_conditions') or [])[:20]],
     }
-    model = str(data.get('model') or 'llama-3.1-8b-instant')
+    model = str(data.get('model') or DEFAULT_GROQ_MODEL)
 
     # A new request supersedes this socket's previous one
     with socket_state_lock:
@@ -1300,7 +1304,7 @@ class LiteratureSearch(Resource):
             data.get('keywords', []),
             data.get('patient_conditions', []),
             data.get('enable_ai_analysis', True),
-            data.get('ai_model', 'llama-3.1-8b-instant'),
+            data.get('ai_model') or DEFAULT_GROQ_MODEL,
             data.get('max_results', 99)  # Pass the parameter with default 99
         )
         
@@ -1360,7 +1364,7 @@ class AIAnalysis(Resource):
         
         text = data.get('text', '')
         analysis_type = data.get('analysis_type', 'summary')
-        model = data.get('model', 'llama-3.1-8b-instant')
+        model = data.get('model') or DEFAULT_GROQ_MODEL
         
         prompt = f"""
         Please analyze the following text for {analysis_type}:
@@ -1520,7 +1524,7 @@ def internal_error(error):
 
 if __name__ == '__main__':
     logger.info("Starting Groq-Powered HCP Engagement API v2.2")
-    logger.info("AI Powered by Groq: Using llama-3.1-8b-instant (Fast & Efficient)")
+    logger.info(f"AI Powered by Groq: default model {DEFAULT_GROQ_MODEL}")
     logger.info("Smart Literature: AI-powered relevance analysis")
     logger.info("Authentication: Bearer token required")
     logger.info("WebSocket: Real-time notifications available")

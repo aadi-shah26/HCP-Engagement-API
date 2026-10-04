@@ -193,7 +193,6 @@ export default function DashboardPage() {
       specialty: filters.specialty || 'General Medicine',
       keywords,
       patient_conditions: conditions,
-      model: 'llama-3.1-8b-instant',
       studies: studies.slice(0, 5).map(({ title, journal, publication_date, abstract }) => ({
         title, journal, publication_date, abstract
       }))
@@ -280,6 +279,7 @@ export default function DashboardPage() {
       // afterwards; otherwise have the REST endpoint run the (blocking) AI analysis itself
       const canStream = !!socketRef.current?.connected;
       let summaryHandled = false;
+      let studies: SearchResult[] = [];
 
       // Fetch literature search
       const literatureResponse = await fetch('/api/proxy/literature/search', {
@@ -294,7 +294,6 @@ export default function DashboardPage() {
           patient_conditions: conditions,
           max_results: 10,
           enable_ai_analysis: !canStream,
-          ai_model: 'llama-3.1-8b-instant'
         })
       });
 
@@ -320,7 +319,7 @@ export default function DashboardPage() {
           console.log('Available data keys:', Object.keys(literatureData.data || {}));
         }
 
-        const studies: SearchResult[] = literatureData.data?.studies || literatureData.studies || [];
+        studies = literatureData.data?.studies || literatureData.studies || [];
         setSearchResults(studies);
         if (canStream && startStreamingSummary(studies, keywords, conditions)) {
           summaryHandled = true;
@@ -331,7 +330,7 @@ export default function DashboardPage() {
       }
 
       // Fetch analytics data
-      await fetchAnalyticsData(searchTerm, conditions, summaryHandled);
+      await fetchAnalyticsData(searchTerm, conditions, summaryHandled, studies);
       
     } catch (error) {
       console.error('Search error:', error);
@@ -340,7 +339,16 @@ export default function DashboardPage() {
     }
   };
 
-  const fetchAnalyticsData = async (query: string, conditions: string[], summaryHandled: boolean) => {
+  const fetchAnalyticsData = async (
+    query: string,
+    conditions: string[],
+    summaryHandled: boolean,
+    studies: SearchResult[]
+  ) => {
+    // Collected locally: React state set here isn't visible until the next render
+    let risk: RiskAssessment | null = null;
+    let cost: CostAnalysis | null = null;
+    let population: PopulationAnalysis | null = null;
     try {
       console.log('Fetching analytics data for query:', query);
       console.log('Extracted conditions:', conditions);
@@ -370,8 +378,8 @@ export default function DashboardPage() {
         const riskData = await riskResponse.json();
         console.log('Risk Assessment API Response:', riskData);
         // Extract the actual data from the response structure
-        const assessmentData = riskData.data || riskData;
-        setRiskAssessment(assessmentData);
+        risk = riskData.data || riskData;
+        setRiskAssessment(risk);
       } else {
         console.error('Risk Assessment API Error:', await riskResponse.text());
       }
@@ -397,8 +405,8 @@ export default function DashboardPage() {
         const costData = await costResponse.json();
         console.log('Cost Analysis API Response:', costData);
         // Extract the actual data from the response structure
-        const analysisData = costData.data || costData;
-        setCostAnalysis(analysisData);
+        cost = costData.data || costData;
+        setCostAnalysis(cost);
       } else {
         console.error('Cost Analysis API Error:', await costResponse.text());
       }
@@ -424,8 +432,8 @@ export default function DashboardPage() {
         const populationData = await populationResponse.json();
         console.log('Population Analysis API Response:', populationData);
         // Extract the actual data from the response structure
-        const analysisData = populationData.data || populationData;
-        setPopulationAnalysis(analysisData);
+        population = populationData.data || populationData;
+        setPopulationAnalysis(population);
       } else {
         console.error('Population Analysis API Error:', await populationResponse.text());
       }
@@ -433,11 +441,9 @@ export default function DashboardPage() {
       setShowAnalytics(true);
       
       // Only generate AI summary via /ai/analyze if neither the literature endpoint nor the
-      // stream provides one (passed in explicitly: the state read here would be a stale closure)
+      // stream provides one. Data is passed in explicitly: state read here would be a stale closure
       if (!summaryHandled) {
-        setTimeout(() => {
-          generateAISummary();
-        }, 300);
+        generateAISummary({ studies, risk, cost, population });
       }
     } catch (error) {
       console.error('Analytics error:', error);
@@ -466,32 +472,36 @@ export default function DashboardPage() {
     setExpandedArticles(newExpanded);
   };
 
-  const generateAISummary = async () => {
+  const generateAISummary = async ({ studies, risk, cost, population }: {
+    studies: SearchResult[];
+    risk: RiskAssessment | null;
+    cost: CostAnalysis | null;
+    population: PopulationAnalysis | null;
+  }) => {
     try {
       setIsGeneratingSummary(true);
       // Build a compact text from current data for analysis
       const lines: string[] = [];
-      if (searchResults && searchResults.length > 0) {
-        lines.push(`Top ${Math.min(searchResults.length, 5)} studies:`);
-        searchResults.slice(0, 5).forEach((s: any, i: number) => {
+      if (studies.length > 0) {
+        lines.push(`Top ${Math.min(studies.length, 5)} studies:`);
+        studies.slice(0, 5).forEach((s: any, i: number) => {
           lines.push(`${i + 1}. ${s.title} (${s.journal}, ${s.publication_date})\nAbstract: ${s.abstract}`);
         });
       }
-      if (riskAssessment) {
-        lines.push(`Risk Assessment → Level: ${riskAssessment.risk_level}, Score: ${riskAssessment.risk_score}, Factors: ${(riskAssessment.risk_factors || []).join(', ')}`);
+      if (risk) {
+        lines.push(`Risk Assessment → Level: ${risk.risk_level}, Score: ${risk.risk_score}, Factors: ${(risk.risk_factors || []).join(', ')}`);
       }
-      if (costAnalysis) {
-        lines.push(`Cost Analysis → Estimated cost: $${costAnalysis.estimated_cost}, Efficiency: ${costAnalysis.cost_efficiency}`);
+      if (cost) {
+        lines.push(`Cost Analysis → Estimated cost: $${cost.estimated_cost}, Efficiency: ${cost.cost_efficiency}`);
       }
-      if (populationAnalysis) {
-        const regions = populationAnalysis.risk_distribution ? Object.keys(populationAnalysis.risk_distribution) : [];
+      if (population) {
+        const regions = population.risk_distribution ? Object.keys(population.risk_distribution) : [];
         lines.push(`Population → Risk distribution regions: ${regions.join(', ')}`);
       }
 
       const payload = {
         text: lines.join('\n\n'),
         analysis_type: 'summary',
-        model: 'llama-3.1-8b-instant',
         context: 'AI summary for HCP dashboard combining literature search and analytics'
       };
       
